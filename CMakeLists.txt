@@ -6,7 +6,7 @@ add_library(toy_concurrency INTERFACE)
 target_include_directories(toy_concurrency INTERFACE 
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
 )
-target_compile_features(toy_concurrency INTERFACE cxx_std_23)
+target_compile_features(toy_concurrency INTERFACE cxx_std_20)
 
 if(PROJECT_IS_TOP_LEVEL)
     add_executable(toy_concurrency_example examples/example.cpp)
