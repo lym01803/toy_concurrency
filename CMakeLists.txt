@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.21)
 
 project(toy_concurrency)
 
@@ -8,5 +8,7 @@ target_include_directories(toy_concurrency INTERFACE
 )
 target_compile_features(toy_concurrency INTERFACE cxx_std_23)
 
-add_executable(toy_concurrency_example examples/example.cpp)
-target_link_libraries(toy_concurrency_example PRIVATE toy_concurrency)
+if(PROJECT_IS_TOP_LEVEL)
+    add_executable(toy_concurrency_example examples/example.cpp)
+    target_link_libraries(toy_concurrency_example PRIVATE toy_concurrency)
+endif()
