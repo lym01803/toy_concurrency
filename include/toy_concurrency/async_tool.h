@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <concepts>
 #include <coroutine>
@@ -8,8 +9,9 @@
 #include <functional>
 #include <memory>
 #include <optional>
-#include <semaphore>
+#include <ranges>
 #include <thread>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 
@@ -917,5 +919,130 @@ template <std::invocable F>
 extended_awaitable<_trivial_call_awaiter<F>> lift(F&& callable) {
   return {{std::forward<F>(callable)}};
 }
+
+struct all_t {
+  template <co_awaitable ...T>
+  struct awaiter {
+    std::tuple<T...> awaiters;
+    std::tuple<value_storage<typename co_awaitable_trait<T>::resume_t>...> values{};
+    std::atomic<int> counter{sizeof...(T)};
+
+    template <size_t I, co_awaitable A>
+    co_task launch_one(A&& _awaitable, std::coroutine_handle<> h) {
+      using retval_t = co_awaitable_trait<A>::resume_t;
+      try {
+        if constexpr (std::is_void_v<retval_t>) {
+          co_await std::forward<A>(_awaitable);
+        } else {
+          std::get<I>(values).set(co_await std::forward<A>(_awaitable));
+        }
+      } catch (...) {
+        std::get<I>(values).e_ptr = std::current_exception();
+      }
+      if (counter.fetch_sub(1, std::memory_order::acq_rel) == 1) {
+        h.resume();
+      }
+    }
+
+    template <size_t... Is>
+    void launch(std::index_sequence<Is...> index, std::coroutine_handle<> h) {
+      (launch_one<Is>(
+           std::forward<std::tuple_element_t<Is, std::tuple<T...>>>(std::get<Is>(awaiters)), h)
+           .detach(),
+       ...);
+    }
+
+    bool await_ready() const noexcept {
+      return false;
+    }
+
+    void await_suspend(std::coroutine_handle<> h) {
+      launch(std::make_index_sequence<sizeof...(T)>(), h);
+    }
+
+    decltype(auto) await_resume() {
+      return std::move(values);
+    }
+  };
+
+  template <std::ranges::input_range Range>
+    requires std::ranges::sized_range<Range>
+  struct range_awaiter {
+    using iter_t = std::ranges::iterator_t<Range>;
+    using awaitable_t = decltype(*std::declval<iter_t>());
+    using retval_t = co_awaitable_trait<awaitable_t>::resume_t;
+
+    Range awaiters;
+    std::vector<value_storage<retval_t>> values;
+    std::atomic<int> counter;
+
+    range_awaiter(Range _awaiters)
+        : awaiters{std::forward<Range>(_awaiters)},
+          values{std::ranges::size(awaiters)},
+          counter{1 + (int)values.size()} {}
+
+    template <co_awaitable A>
+    co_task launch_one(A&& awaiter, size_t idx, std::coroutine_handle<> h) {
+      try {
+        if constexpr (std::is_void_v<retval_t>) {
+          co_await std::forward<A>(awaiter);
+        } else {
+          values[idx].set(co_await std::forward<A>(awaiter));
+        }
+      } catch (...) {
+        values[idx].e_ptr = std::current_exception();
+      }
+      if (counter.fetch_sub(1, std::memory_order::acq_rel) == 1) {
+        h.resume();
+      }
+    }
+
+    bool await_ready() const noexcept {
+      return false;
+    }
+
+    void await_suspend(std::coroutine_handle<> h) {
+      size_t idx = 0;
+      for (awaitable_t&& awaiter : awaiters) {
+        launch_one(std::forward<awaitable_t>(awaiter), idx++, h).detach();
+      }
+      if (counter.fetch_sub(1, std::memory_order::acq_rel) == 1) {
+        h.resume();
+      }
+    }
+
+    decltype(auto) await_resume() {
+      return std::move(values);
+    }
+  };
+
+  template <co_awaitable... T>
+  auto operator()(T&&... awaiters) const {
+    return awaiter<T...>{.awaiters = {std::forward<T>(awaiters)...}};
+  }
+
+  struct range_tag {};
+
+  template <std::ranges::input_range Range>
+  auto operator()(range_tag _, Range&& awaiters) const {
+    return range_awaiter<Range>{std::forward<Range>(awaiters)};
+  }
+
+  static constexpr range_tag range;
+};
+
+constexpr all_t all{};
+
+template <typename T, typename Tuple, size_t... Is>
+auto _to_array(Tuple values, std::index_sequence<Is...> index) {
+  return std::array<T, sizeof...(Is)>{std::get<Is>(values).get()...};
+}
+
+template <typename T, typename... Ts>
+  requires (std::is_same_v<T, Ts> && ... && true)
+auto to_array(std::tuple<value_storage<T>, value_storage<Ts>...> values) {
+  return _to_array<T>(std::move(values), std::make_index_sequence<sizeof...(Ts) + 1>());
+}
+
 
 };  // namespace async

@@ -1,6 +1,8 @@
 #include <cstdlib>
 #include <iostream>
 #include <random>
+#include <ranges>
+#include <utility>
 #include <vector>
 
 #include <toy_concurrency/async_tool.h>
@@ -27,6 +29,7 @@ struct uniform_random {
 struct toy_server {
   struct request_t {
     int num_of_char;
+    std::string content = "x";
   };
 
   enum class code_t : uint8_t { Done, Streaming };
@@ -47,7 +50,7 @@ struct toy_server {
       for (size_t i = 0; i < req.num_of_char; i++) {
         std::this_thread::sleep_for(std::chrono::milliseconds(rd()));
         if (auto _receive = receive.lock()) {
-          _receive->write_sync(response_t{.code = code_t::Streaming, .content = "x"});
+          _receive->write_sync(response_t{.code = code_t::Streaming, .content = req.content});
         } else {
           break;
         }
@@ -96,9 +99,9 @@ struct toy_client {
     }
   };
 
-  stream_response_t stream_request(toy_server& server, int num) {
+  stream_response_t stream_request(toy_server& server, request_t req) {
     stream_response_t resp{std::make_shared<stream_t>()};
-    server.request(request_t{.num_of_char = num}, resp.stream);
+    server.request(std::move(req), resp.stream);
     return resp;
   }
 };
@@ -110,13 +113,12 @@ void example_1() {
   auto server = toy_server{};
   auto client = toy_client{};
   using msg_t = toy_client::msg_t;
-  using response_t = toy_client::response_t;
-  auto resp = client.stream_request(server, 100);
+  using request_t = toy_client::request_t;
 
   auto executor = runner<cancellable_function<void>>{};
 
-  auto task = []<typename resp_t, typename executor_t>(resp_t& resp,
-                                                       executor_t& executor) -> co_task {
+  auto create_task = []<typename resp_t, typename executor_t>(resp_t resp, executor_t &executor) 
+    -> co_task {
     msg_t msg_buffer;
     while (true) {
       auto chunk = co_await lift(resp.get_chunk(msg_buffer)).back_to(executor);
@@ -127,10 +129,19 @@ void example_1() {
         break;
       }
     }
-    std::cout << std::endl;
-  }(resp, executor).get_future();
+  };
 
-  std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+  auto mini_tasks = std::vector<request_t> {{60, "A"}, {40, "B"}, {20, "C"}} |
+    std::views::transform([&](request_t& req) {
+      return create_task(client.stream_request(server, std::move(req)), executor);
+    });
+
+  auto task = [](auto mini_tasks) -> co_task {
+    co_await all(all.range, std::move(mini_tasks));
+    std::cout << std::endl;
+  }(std::move(mini_tasks)).get_future();
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(1000)); // 验证: 主线程阻塞, 而协程仍在运行
   task.get();
 }
 
