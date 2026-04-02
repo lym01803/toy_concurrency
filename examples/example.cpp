@@ -136,7 +136,7 @@ void example_1() {
       return create_task(client.stream_request(server, std::move(req)), executor);
     });
 
-  auto task = [](auto mini_tasks) -> co_task {
+  auto task = [](decltype(mini_tasks)&& mini_tasks) -> co_task {
     co_await all(all.range, std::move(mini_tasks));
     std::cout << std::endl;
   }(std::move(mini_tasks)).get_future();

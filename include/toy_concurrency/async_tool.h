@@ -5,6 +5,7 @@
 #include <atomic>
 #include <concepts>
 #include <coroutine>
+#include <cstddef>
 #include <exception>
 #include <functional>
 #include <memory>
@@ -352,6 +353,53 @@ struct next_awaitable {
   void await_resume() const noexcept {}
 };
 
+struct guarded_co_handle {
+  std::coroutine_handle<> h;
+
+ public:
+  guarded_co_handle() noexcept = default;
+  guarded_co_handle(nullptr_t) noexcept {}
+
+  template <typename PromiseT>
+  guarded_co_handle(std::coroutine_handle<PromiseT> h) noexcept : h{h} {}
+
+  ~guarded_co_handle() {
+    if (h) {
+      h.destroy();
+    }
+  }
+
+  guarded_co_handle(guarded_co_handle&& other) noexcept : h{other.h} {
+    other.h = nullptr;
+  }
+
+  guarded_co_handle& operator=(guarded_co_handle&& other) noexcept {
+    if (this == std::addressof(other)) {
+      return *this;
+    }
+    if (h) {
+      h.destroy();
+    }
+    h = other.h;
+    other.h = nullptr;
+    return *this;
+  }
+
+  std::coroutine_handle<> release() noexcept {
+    const auto temp_h = h;
+    h = nullptr;
+    return temp_h;
+  }
+
+  std::coroutine_handle<> get() const noexcept {
+    return h;
+  }
+
+  operator bool() const noexcept {
+    return (bool)h;
+  }
+};
+
 /**
  * @brief 通用协程任务 (Lazy 模式)
  * * * **设计模式**：Lazy Execution。协程创建后处于暂停状态，必须显式启动。
@@ -376,8 +424,9 @@ struct co_task_with {
     }
 
     auto get_return_object() {
-      return co_task_with{.co_handle = std::coroutine_handle<promise_type>::from_promise(*this),
-                          .promise = *this};
+      return co_task_with{
+          .co_handle = guarded_co_handle(std::coroutine_handle<promise_type>::from_promise(*this)),
+          .promise = *this};
     }
     auto initial_suspend() {
       return std::suspend_always{};
@@ -392,7 +441,7 @@ struct co_task_with {
    * @brief 分离任务: 启动协程
    */
   void detach() & {
-    co_handle.resume();
+    co_handle.release().resume();
   }
 
   /**
@@ -403,11 +452,11 @@ struct co_task_with {
   }
 
   co_task_awaitable<T> wait() & {
-    return co_task_awaitable<T>{*this};
+    return co_task_awaitable<T>{promise, co_handle.release()};
   }
 
   co_task_awaitable<T> wait() && {
-    return co_task_awaitable<T>{*this};
+    return co_task_awaitable<T>{promise, co_handle.release()};
   }
 
   /**
@@ -458,7 +507,7 @@ struct co_task_with {
     return this->get_future();
   }
 
-  std::coroutine_handle<promise_type> co_handle;
+  guarded_co_handle co_handle;
   promise_type& promise;
 };
 
@@ -468,8 +517,8 @@ struct co_task_awaitable {
   task_t::promise_type& promise;
   std::coroutine_handle<> task_co_handle;
 
-  co_task_awaitable(task_t& _task)
-      : promise(_task.promise), task_co_handle(_task.co_handle) {}
+  co_task_awaitable(task_t::promise_type& promise, std::coroutine_handle<> h)
+      : promise(promise), task_co_handle(h) {}
 
   bool await_ready() const noexcept {
     return false;
@@ -511,17 +560,22 @@ struct yield_task : protected co_task_with<T> {
     }
   };
 
-  yield_task(const base& _base, promise_type& _promise) : base{_base}, promise{_promise} {}
+  yield_task(base _base, promise_type& _promise) : base{std::move(_base)}, promise{_promise} {}
+
+  ~yield_task() {
+    if (returned) {
+      this->co_handle.release();
+    }
+  }
 
   void cancel() {  // coroutine must be suspended when calling cancel
-    if (!returned && this->co_handle != nullptr) {
-      this->co_handle.destroy();
-      this->co_handle = nullptr;
+    if (!returned && this->co_handle) {
+      this->co_handle.release().destroy();
     }
   }
 
   auto wait() & {
-    return yield_task_awaitable<T>{*this};
+    return yield_task_awaitable<T>{promise, this->co_handle.get(), returned};
   }
 
   decltype(auto) operator co_await() & {
@@ -541,8 +595,8 @@ struct yield_task_awaitable {
   std::coroutine_handle<> task_co_handle;
   bool& returned;
 
-  yield_task_awaitable(task_t& _task)
-      : promise(_task.promise), task_co_handle(_task.co_handle), returned{_task.returned} {}
+  yield_task_awaitable(task_t::promise_type& promise, std::coroutine_handle<> h, bool& returned)
+      : promise(promise), task_co_handle(h), returned{returned} {}
 
   bool await_ready() const noexcept {
     return false;
