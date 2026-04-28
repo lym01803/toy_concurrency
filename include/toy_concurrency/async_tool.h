@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <exception>
 #include <functional>
+#include <future>
 #include <memory>
 #include <optional>
 #include <ranges>
@@ -294,8 +295,11 @@ using return_mixin =
 template <typename T>
 struct co_task_awaitable;
 
+template <typename T>
+struct task_promise;
+
 /**
- * @brief 任务 Future 手柄
+ * @brief 任务 Future Token
  * * 同步等待 task 返回结果: 基于 std::binary_semaphore (counting_semaphore) 实现阻塞/唤醒。
  * @note 仅保证**第一次**调用 wait() 有效（资源移动语义）。
  */
@@ -322,7 +326,6 @@ struct task_future {
       return _done.load(std::memory_order_relaxed);
     }
   };
-  std::shared_ptr<state> state_ptr = std::make_shared<state>();
 
   /**
    * @brief 阻塞当前线程直到任务完成并获取结果, 仅保证第一次调用有效
@@ -338,6 +341,30 @@ struct task_future {
   bool done() const {
     return state_ptr->done();
   }
+
+  friend task_promise<T>;
+ private:
+  std::shared_ptr<state> state_ptr = std::make_shared<state>();
+};
+
+template <typename T>
+struct task_promise {
+  task_promise(task_future<T> task) : state_ptr(task.state_ptr) {}
+  task_promise(task_promise &&other) noexcept = default;
+  task_promise(const task_promise &other) = delete;
+  task_promise &operator=(task_promise &&other) noexcept = default;
+  task_promise &operator=(const task_promise &other) = delete;
+
+  ~task_promise() {
+    // task_promise is the unique writer of state
+    if (state_ptr != nullptr && !(state_ptr->done())) {
+      state_ptr->retval.e_ptr =
+          std::make_exception_ptr(std::future_error{std::future_errc::broken_promise});
+      state_ptr->release();
+    }
+  }
+
+  std::shared_ptr<typename task_future<T>::state> state_ptr;
 };
 
 struct next_awaitable {
@@ -487,17 +514,18 @@ struct co_task_with {
     task_future<T> future;
     [this](task_future<T> future)
         -> co_task_with<> {  // copy a future here, valid until coroutine frame destroyed.
+      task_promise<T> promise{std::move(future)};
       try {
         if constexpr (std::is_void_v<T>) {
           co_await this->wait();  // this is valid until suspend
-          future.state_ptr->release();
+          promise.state_ptr->release();
         } else {
-          future.state_ptr->retval.set(co_await this->wait());  // this is valid until suspend
-          future.state_ptr->release();
+          promise.state_ptr->retval.set(co_await this->wait());  // this is valid until suspend
+          promise.state_ptr->release();
         }
       } catch (...) {
-        future.state_ptr->retval.e_ptr = std::current_exception();
-        future.state_ptr->release();
+        promise.state_ptr->retval.e_ptr = std::current_exception();
+        promise.state_ptr->release();
       }
     }(future).detach();
     return future;
