@@ -615,18 +615,26 @@ struct yield_task_awaitable {
   }
 };
 
-struct cancel_mixin {
-  std::function<void()> _cancel{[]() {}};
-  void cancel() const {
-    _cancel();
+template <bool Copyable, typename T>
+struct choose_ptr;
+
+template <typename T>
+struct choose_ptr<true, T> {
+  using ptr_t = std::shared_ptr<T>;
+
+  template <typename U, typename ...Args>
+  static ptr_t make(Args&&... args) {
+    return std::make_shared<U>(std::forward<Args>(args)...);
   }
 };
 
-template <typename R, typename... Args>
-struct call_mixin {
-  std::function<R(Args...)> call;
-  R operator()(Args... args) {
-    return call(std::forward<Args>(args)...);
+template <typename T>
+struct choose_ptr<false, T> {
+  using ptr_t = std::unique_ptr<T>;
+
+  template <typename U, typename ...Args>
+  static ptr_t make(Args&&... args) {
+    return std::make_unique<U>(std::forward<Args>(args)...);
   }
 };
 
@@ -635,18 +643,87 @@ struct call_mixin {
  * * 封装了“执行逻辑”和“取消逻辑”的函数对象。
  * 用于提交给支持取消操作的 Executor。
  */
-template <typename R, typename... Args>
-struct cancellable_function : public cancel_mixin, public call_mixin<R, Args...> {
-  using cancel_base = cancel_mixin;
-  using call_base = call_mixin<R, Args...>;
+template <bool Copyable, typename R, typename... Args>
+struct cancellable_function_ {
+  struct base {
+    virtual ~base() = default;
+    virtual R operator()(Args ...args) = 0;
+    virtual void cancel() = 0;
+  };
 
-  template <typename F, typename C>
-  cancellable_function(F func, C cancel)
-      : cancel_base{std::move(cancel)}, call_base{std::move(func)} {}
+  template <std::invocable<Args...> F, std::invocable C>
+    requires std::convertible_to<std::invoke_result_t<F, Args...>, R>
+  struct derived_with_cancel : public base {
+    F _func;
+    C _cancel;
+    derived_with_cancel(F&& func, C&& cancel)
+        : _func(std::forward<F>(func)), _cancel(std::forward<C>(cancel)) {}
+    R operator()(Args ...args) override {
+      return std::invoke(_func, std::forward<Args>(args)...);
+    }
+    void cancel() override {
+      std::invoke(_cancel);
+    }
+  };
+
+  template <std::invocable<Args...> F>
+    requires std::convertible_to<std::invoke_result_t<F, Args...>, R>
+  struct derived_without_cancel : public base {
+    F _func;
+    derived_without_cancel(F&& func) : _func(std::forward<F>(func)) {}
+    R operator()(Args ...args) override {
+      return std::invoke(_func, std::forward<Args>(args)...);
+    }
+    void cancel() override {}
+  };
+
+  template <std::invocable<Args...> F>
+    requires std::convertible_to<std::invoke_result_t<F, Args...>, R> && cancellable<F>
+  struct derived_cancellable : public base {
+    F _func;
+    derived_cancellable(F&& func) : _func(std::forward<F>(func)) {}
+    R operator()(Args ...args) override {
+      return std::invoke(_func, std::forward<Args>(args)...);
+    }
+    void cancel() override {
+      _func.cancel();
+    }
+  };
+
+  using ptr_choose = choose_ptr<Copyable, base>;
+  using ptr_t = ptr_choose::ptr_t;
+
+  ptr_t ptr;
 
   template <typename F>
-  cancellable_function(F func) : cancel_base{}, call_base{std::move(func)} {}
+    requires cancellable<F>
+  cancellable_function_(F&& _func)
+      : ptr(ptr_choose::template make<derived_cancellable<F>>(std::forward<F>(_func))) {}
+
+  template <typename F>
+    requires(!cancellable<F>)
+  cancellable_function_(F&& _func)
+      : ptr(ptr_choose::template make<derived_without_cancel<F>>(std::forward<F>(_func))) {}
+
+  template <typename F, typename C>
+  cancellable_function_(F&& _func, C&& _cancel)
+      : ptr(ptr_choose::template make<derived_with_cancel<F, C>>(std::forward<F>(_func),
+                                                                 std::forward<C>(_cancel))) {}
+
+  R operator()(Args... args) {
+    return ptr->operator()(std::forward<Args>(args)...);
+  }
+
+  void cancel() {
+    ptr->cancel();
+  }
 };
+
+template <typename R, typename... Args>
+using cancellable_function = cancellable_function_<false, R, Args...>;
+
+template <typename R, typename... Args>
+using copyable_cancellable_function = cancellable_function_<true, R, Args...>;
 
 template <typename T, typename Op, stream_with_op<T, Op> Stream>
 auto to_function(to_execute_t<T, Op, Stream> to_execute) {
@@ -666,7 +743,8 @@ struct execute_by_awaitable {
     return false;
   }
   void await_suspend(std::coroutine_handle<> h) {
-    executor(cancellable_function<void>{[=]() { h.resume(); }, [=]() { h.destroy(); }});
+    executor(cancellable_function<void>::derived_with_cancel{[=]() { h.resume(); },
+                                                             [=]() { h.destroy(); }});
   }
   void await_resume() const noexcept {}
 };
@@ -682,8 +760,9 @@ auto execute_by(Executor& executor) {
 }
 
 struct trivial_executor_t {
-  void operator()(std::function<void()> f) const {
-    std::thread th{[f = std::move(f)]() { f(); }};
+  template <std::invocable F>
+  void operator()(F f) const {
+    std::thread th{std::move(f)};
     th.detach();
   }
 };
@@ -706,7 +785,7 @@ struct async_call_t {
       return false;
     }
     void await_suspend(std::coroutine_handle<> h) {
-      executor(cancellable_function<void>(
+      executor(cancellable_function<void>::derived_with_cancel(
           [this, h, f = std::move(f)]() {
             retval.execute([&]() -> decltype(auto) { return f(); });  // sync call
             h.resume();
