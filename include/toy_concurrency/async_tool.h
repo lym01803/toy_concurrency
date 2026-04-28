@@ -508,7 +508,7 @@ struct co_task_with {
   }
 
   guarded_co_handle co_handle;
-  promise_type& promise;
+  std::reference_wrapper<promise_type> promise;
 };
 
 template <typename T>
