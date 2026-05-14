@@ -567,7 +567,7 @@ struct co_task_awaitable {
     promise.next = h;
     return task_co_handle;  // transfer to run co_handle.resume();
   }
-  T await_resume() const noexcept { // task may be invalid here
+  T await_resume() const { // task may be invalid here
     value_storage<T> value{std::move(promise.retval)};
     task_co_handle.destroy();
     return std::move(value).get();
