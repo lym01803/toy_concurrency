@@ -16,6 +16,7 @@
 #include <tuple>
 #include <type_traits>
 #include <utility>
+#include <variant>
 
 namespace async {
 
@@ -1284,5 +1285,137 @@ auto to_array(std::tuple<value_storage<T>, value_storage<Ts>...> values) {
   return _to_array<T>(std::move(values), std::make_index_sequence<sizeof...(Ts) + 1>());
 }
 
+struct any_t {
+  template <co_awaitable ...T>
+  struct awaiter {
+    struct result_t {
+      using variant_t =
+          std::variant<value_storage<typename co_awaitable_trait<T>::resume_t>..., std::monostate>;
+      size_t index = 0;
+      variant_t value{std::monostate{}};
+    };
+
+    std::tuple<T...> awaiters;
+    result_t result{};
+    std::shared_ptr<std::atomic<int>> seized = std::make_shared<std::atomic<int>>(0);
+
+    template <size_t I, co_awaitable A>
+    co_task launch_one(A&& _awaitable, std::coroutine_handle<> h,
+                       std::shared_ptr<std::atomic<int>> seized) {
+      using retval_t = co_awaitable_trait<A>::resume_t;
+      value_storage<retval_t> value;
+      try {
+        if constexpr (std::is_void_v<retval_t>) {
+          co_await std::forward<A>(_awaitable);
+        } else {
+          value.set(co_await std::forward<A>(_awaitable));
+        }
+      } catch (...) {
+        value.e_ptr = std::current_exception();
+      }
+      int expected = 0;
+      if (seized->compare_exchange_strong(expected, 1, std::memory_order::acquire,
+                                          std::memory_order::relaxed)) {
+        // result is valid before (the only one) resume
+        result.index = I;
+        result.value = typename result_t::variant_t{std::in_place_index<I>, std::move(value)};
+        h.resume();
+      }
+    }
+
+    template <size_t... Is>
+    void launch(std::index_sequence<Is...> index, std::coroutine_handle<> h) {
+      std::tuple<T...> awaiters = std::move(this->awaiters); // 从协程帧转到调用栈上
+      auto seized = this->seized; // 拷贝一份到调用栈
+      (launch_one<Is>(
+           std::forward<std::tuple_element_t<Is, std::tuple<T...>>>(std::get<Is>(awaiters)), h,
+           seized).detach(),
+       ...);
+    }
+
+    bool await_ready() const noexcept {
+      return false;
+    }
+
+    void await_suspend(std::coroutine_handle<> h) {
+      launch(std::make_index_sequence<sizeof...(T)>(), h);
+    }
+
+    decltype(auto) await_resume() {
+      return std::move(result); // result is valid before await_resume
+    }
+  };
+
+  template <std::ranges::input_range Range>
+  struct range_awaiter {
+    using iter_t = std::ranges::iterator_t<Range>;
+    using awaitable_t = decltype(*std::declval<iter_t>());
+    using retval_t = co_awaitable_trait<awaitable_t>::resume_t;
+
+    struct result_t {
+      size_t index = 0;
+      value_storage<retval_t> value{};
+    };
+
+    Range awaiters;
+    result_t result{};
+    std::shared_ptr<std::atomic<int>> seized = std::make_shared<std::atomic<int>>(0);
+
+    template <co_awaitable A>
+    co_task launch_one(A&& _awaitable, size_t idx, std::coroutine_handle<> h, 
+                       std::shared_ptr<std::atomic<int>> seized) {
+      value_storage<retval_t> value;
+      try {
+        if constexpr (std::is_void_v<retval_t>) {
+          co_await std::forward<A>(_awaitable);
+        } else {
+          value.set(co_await std::forward<A>(_awaitable));
+        }
+      } catch (...) {
+        value.e_ptr = std::current_exception();
+      }
+      int expected = 0;
+      if (seized->compare_exchange_strong(expected, 1, std::memory_order::acquire,
+                                          std::memory_order::relaxed)) {
+        result.index = idx;
+        result.value = std::move(value); // result is valid before (the only one) resume
+        h.resume();
+      }
+    }
+
+    bool await_ready() const noexcept {
+      return false;
+    }
+
+    void await_suspend(std::coroutine_handle<> h) {
+      Range awaiters = std::forward<Range>(this->awaiters); // 从协程帧转到调用栈上
+      auto seized = this->seized; // 拷贝一份到调用栈
+      size_t idx = 0;
+      for (awaitable_t&& awaiter : awaiters) {
+        launch_one(std::forward<awaitable_t>(awaiter), idx++, h, seized).detach();
+      }
+    }
+
+    decltype(auto) await_resume() {
+      return std::move(result); // result is valid before await_resume
+    }
+  };
+
+  template <co_awaitable... T>
+  auto operator()(T&&... awaiters) const {
+    return awaiter<T...>{.awaiters = std::tuple<T...>{std::forward<T>(awaiters)...}};
+  }
+
+  struct range_tag {};
+
+  template <std::ranges::input_range Range>
+  auto operator()(range_tag _, Range&& awaiters) const {
+    return range_awaiter<Range>{.awaiters = std::forward<Range>(awaiters)};
+  }
+
+  static constexpr range_tag range;
+};
+
+constexpr any_t any{};
 
 };  // namespace async

@@ -1,7 +1,9 @@
+#include <chrono>
 #include <cstdlib>
 #include <iostream>
 #include <random>
 #include <ranges>
+#include <stop_token>
 #include <utility>
 #include <vector>
 
@@ -257,8 +259,35 @@ void example_2() {
   }(prime_count.get(), N, gui.scheduler()).get_future().get();
 }
 
+void example_3() {
+  playground::runner<async::cancellable_function<void>> worker;
+
+  [](decltype(worker) &worker) -> async::co_task {
+    using signal_t = std::shared_ptr<std::binary_semaphore>;
+    signal_t signal = std::make_shared<std::binary_semaphore>(0);
+    std::stop_source stop;
+
+    const auto result = co_await async::any(
+      [](signal_t signal, std::stop_token token,
+          decltype(worker) &worker) -> async::co_task { // 等待信号
+        std::stop_callback callback{token, [&]() { signal->release(); }};
+        co_await async::lift([&]() { signal->acquire(); }).on(worker);
+        std::cout << "Wake up by signal.\n" << std::flush;
+      }(signal, stop.get_token(), worker),
+      [](std::stop_source stop) -> async::co_task { // 超时, 发布信号
+        co_await async::lift([]() {
+          std::this_thread::sleep_for(std::chrono::milliseconds{1000});
+        }).on(async::trivial_executor);
+        stop.request_stop();
+      }(stop)
+    );
+    std::cout << std::format("co_task {} finished first.\n", result.index) << std::flush;
+  }(worker).get_future().get();
+}
+
 int main() {
   example_1();
   example_2();
+  example_3();
   return 0;
 }
