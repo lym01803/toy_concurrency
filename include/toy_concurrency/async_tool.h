@@ -525,22 +525,22 @@ struct co_task_with {
    */
   task_future<T> get_future() & {
     task_future<T> future;
-    [this](task_future<T> future)
+    [](co_task_with &self, task_future<T> future)
         -> co_task_with<> {  // copy a future here, valid until coroutine frame destroyed.
       task_promise<T> promise{std::move(future)};
       try {
         if constexpr (std::is_void_v<T>) {
-          co_await this->wait();  // this is valid until suspend
+          co_await self.wait();  // self is valid until suspend
           promise.state_ptr->release();
         } else {
-          promise.state_ptr->retval.set(co_await this->wait());  // this is valid until suspend
+          promise.state_ptr->retval.set(co_await self.wait());  // self is valid until suspend
           promise.state_ptr->release();
         }
       } catch (...) {
         promise.state_ptr->retval.e_ptr = std::current_exception();
         promise.state_ptr->release();
       }
-    }(future).detach();
+    }(*this, future).detach();
     return future;
   }
 
